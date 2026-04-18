@@ -1,0 +1,10 @@
+{
+  "Name": "Stardew Mod Compatibility Fixer",
+  "Author": "JosephsDeadish",
+  "Version": "1.0.0",
+  "Description": "Automatically detects portrait/body mod overlaps, adds portrait compatibility handling, and provides optional GMCM controls.",
+  "UniqueID": "JosephsDeadish.StardewModCompatibilityFixer",
+  "EntryDll": "StardewModCompatibilityFixer.dll",
+  "MinimumApiVersion": "4.0.0",
+  "UpdateKeys": []
+}
