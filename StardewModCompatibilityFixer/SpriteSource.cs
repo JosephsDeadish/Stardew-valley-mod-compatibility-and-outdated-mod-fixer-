@@ -7,4 +7,9 @@ internal sealed record SpriteSource(
     string ModUniqueId,
     string FilePath,
     /// <summary>Family name of the adult mod that owns this sprite, or <c>null</c> for non-adult mods.</summary>
-    string? AdultModFamily = null);
+    string? AdultModFamily = null,
+    /// <summary>
+    /// Bitmask of scene types this sprite source is known to support.
+    /// Defaults to FemaleMale when unknown.
+    /// </summary>
+    SceneTypeFlags SupportedSceneTypes = SceneTypeFlags.FemaleMale);

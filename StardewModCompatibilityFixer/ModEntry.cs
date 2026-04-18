@@ -28,8 +28,14 @@ public sealed class ModEntry : Mod
     private readonly Dictionary<string, List<SpriteSource>> spriteSourcesByAsset =
         new(StringComparer.OrdinalIgnoreCase);
 
+    // Portrait thumbnail cache for GMCMOptions image carousel (lazily populated)
+    private readonly Dictionary<string, Texture2D?> portraitThumbnailCache =
+        new(StringComparer.OrdinalIgnoreCase);
+
     private List<ResolvedAdultMod> activeAdultMods = [];
     private SceneContextTracker? sceneContext;
+    private GenderContext? genderContext;
+    private ScenePreSelector? scenePreSelector;
     private ModConfig config = new();
     private bool portraitureInstalled;
     private bool gmcmRegistered;
@@ -68,6 +74,8 @@ public sealed class ModEntry : Mod
     {
         // Mods don't change after launch, but re-index to pick up dynamic content packs.
         this.RefreshCompatibilityState();
+        // Invalidate portrait thumbnail cache so textures are reloaded for the new save
+        this.portraitThumbnailCache.Clear();
     }
 
     private void OnUpdateTicked(object? sender, UpdateTickedEventArgs e)
@@ -136,8 +144,29 @@ public sealed class ModEntry : Mod
         this.portraitureInstalled = this.ModRegistry.GetAll()
             .Any(mod => PortraitureIds.Contains(mod.Manifest.UniqueID, StringComparer.OrdinalIgnoreCase));
 
+        // Step 1: known adult mod matching
         this.activeAdultMods = AdultModRegistry.Resolve(this.ModRegistry.GetAll());
+
+        // Step 2: heuristic detection of unknown/unregistered adult mods
+        List<ResolvedAdultMod> unknownMods = AdultModRegistry.ResolveUnknown(
+            this.ModRegistry.GetAll(), this.activeAdultMods);
+
+        if (unknownMods.Count > 0)
+        {
+            string unknownNames = string.Join(", ", unknownMods.Select(m =>
+                $"'{m.Info.Manifest.Name}' ({m.Info.Manifest.UniqueID})"));
+            this.Monitor.Log(
+                $"[CompatFixer] Heuristically detected {unknownMods.Count} unregistered adult mod(s): {unknownNames}. " +
+                $"They will be treated as generic adult mods with FemaleMale scene support.",
+                LogLevel.Info);
+            this.activeAdultMods.AddRange(unknownMods);
+        }
+
         this.LogAdultModState();
+
+        // Step 3: gender context and scene pre-selector
+        this.genderContext    = new GenderContext(this.config);
+        this.scenePreSelector = new ScenePreSelector(this.config, this.activeAdultMods, this.genderContext);
 
         this.IndexPortraitMods();
         this.IndexSpriteMods();
@@ -154,7 +183,7 @@ public sealed class ModEntry : Mod
     {
         if (this.activeAdultMods.Count == 0)
         {
-            this.Monitor.Log("[CompatFixer] No known adult mods detected.", LogLevel.Debug);
+            this.Monitor.Log("[CompatFixer] No adult mods detected.", LogLevel.Debug);
             return;
         }
 
@@ -173,7 +202,7 @@ public sealed class ModEntry : Mod
                 if (compat)
                     this.Monitor.Log($"[CompatFixer] {fA} ↔ {fB}: body-compatible, shared assets allowed.", LogLevel.Info);
                 else
-                    this.Monitor.Log($"[CompatFixer] {fA} ↔ {fB}: NOT body-compatible. Scene-context routing active to prevent asset bleed.", LogLevel.Warn);
+                    this.Monitor.Log($"[CompatFixer] {fA} ↔ {fB}: NOT body-compatible. Scene-context routing active.", LogLevel.Warn);
             }
         }
     }
@@ -262,6 +291,9 @@ public sealed class ModEntry : Mod
     private void IndexSpritesForMod(IModInfo modInfo)
     {
         string? adultFamily = this.GetAdultFamily(modInfo.Manifest.UniqueID);
+        SceneTypeFlags supportedScenes = this.activeAdultMods
+            .FirstOrDefault(r => string.Equals(r.Info.Manifest.UniqueID, modInfo.Manifest.UniqueID, StringComparison.OrdinalIgnoreCase))
+            ?.Definition.SupportedSceneTypes ?? SceneTypeFlags.FemaleMale;
 
         foreach (string filePath in Directory.EnumerateFiles(modInfo.DirectoryPath, "*.*", SearchOption.AllDirectories))
         {
@@ -272,7 +304,7 @@ public sealed class ModEntry : Mod
             if (assetName is null)
                 continue;
 
-            var source = new SpriteSource(assetName, modInfo.Manifest.UniqueID, filePath, adultFamily);
+            var source = new SpriteSource(assetName, modInfo.Manifest.UniqueID, filePath, adultFamily, supportedScenes);
 
             if (!this.spriteSourcesByAsset.TryGetValue(assetName, out List<SpriteSource>? list))
             {
@@ -291,6 +323,8 @@ public sealed class ModEntry : Mod
 
     private PortraitSource? SelectPortraitSource(string assetName, List<PortraitSource> sources)
     {
+        string npcName = GetNpcNameFromAsset(assetName);
+
         // 1. Scene context: use the owning adult mod's portrait exclusively
         if (this.sceneContext?.ActiveSceneFamilyName is string sceneFamilyName)
         {
@@ -303,7 +337,6 @@ public sealed class ModEntry : Mod
         }
 
         // 2. Per-NPC user config preference
-        string npcName = GetNpcNameFromAsset(assetName);
         if (this.config.PreferredPortraitModByNpc.TryGetValue(npcName, out string? preferredId))
         {
             PortraitSource? preferred = sources.FirstOrDefault(s =>
@@ -344,20 +377,35 @@ public sealed class ModEntry : Mod
 
     private SpriteSource? SelectSpriteSource(string assetName, List<SpriteSource> sources)
     {
-        // 1. Scene context: use the owning adult mod's sprite
+        string npcName = GetNpcNameFromAsset(assetName);
+
+        // 1. Scene context: use the owning adult mod's sprite, filtered by active scene type
         if (this.sceneContext?.ActiveSceneFamilyName is string sceneFamilyName)
         {
+            SceneTypeFlags preferredScene = this.scenePreSelector?.GetPreferredSceneType(npcName)
+                ?? SceneTypeFlags.FemaleMale;
+
             SpriteSource? sceneMatch = sources
+                .Where(s => string.Equals(s.AdultModFamily, sceneFamilyName, StringComparison.OrdinalIgnoreCase)
+                            && s.SupportedSceneTypes.HasFlag(preferredScene))
+                .OrderBy(s => s.FilePath, StringComparer.OrdinalIgnoreCase)
+                .FirstOrDefault();
+
+            // Fallback: any source from the scene's mod regardless of scene type
+            sceneMatch ??= sources
                 .Where(s => string.Equals(s.AdultModFamily, sceneFamilyName, StringComparison.OrdinalIgnoreCase))
                 .OrderBy(s => s.FilePath, StringComparer.OrdinalIgnoreCase)
                 .FirstOrDefault();
+
             if (sceneMatch is not null)
                 return sceneMatch;
         }
 
         // 2. For player sprites, honour the ForceBodyModForPlayer config
         if (assetName.Contains("Farmer_", StringComparison.OrdinalIgnoreCase)
-            && this.config.ForceBodyModForPlayer is string forcedFamily)
+            && this.config.ForceBodyModForPlayer is string forcedFamily
+            && !string.IsNullOrEmpty(forcedFamily)
+            && !forcedFamily.Equals("(auto)", StringComparison.OrdinalIgnoreCase))
         {
             SpriteSource? forced = sources.FirstOrDefault(s =>
                 string.Equals(this.GetAdultFamily(s.ModUniqueId), forcedFamily, StringComparison.OrdinalIgnoreCase));
@@ -365,7 +413,16 @@ public sealed class ModEntry : Mod
                 return forced;
         }
 
-        // 3. Filter incompatible body sources
+        // 3. Per-NPC sprite override from config
+        if (this.config.PreferredSpriteModByNpc.TryGetValue(npcName, out string? preferredSpriteId))
+        {
+            SpriteSource? preferredSprite = sources.FirstOrDefault(s =>
+                string.Equals(s.ModUniqueId, preferredSpriteId, StringComparison.OrdinalIgnoreCase));
+            if (preferredSprite is not null)
+                return preferredSprite;
+        }
+
+        // 4. Filter incompatible body sources
         SpriteSource[] compatible = this.FilterCompatibleSprites(sources, assetName);
         if (compatible.Length == 0)
             return null;
@@ -451,12 +508,16 @@ public sealed class ModEntry : Mod
         if (gmcm is null)
             return;
 
+        // Optional image-carousel API (GMCMOptions mod)
+        IGMCMOptionsApi? gmcmOpts = this.Helper.ModRegistry
+            .GetApi<IGMCMOptionsApi>("spacechase0.GMCMOptions");
+
         gmcm.Register(
             this.ModManifest,
             reset: () => this.config = new ModConfig(),
             save:  () => this.Helper.WriteConfig(this.config));
 
-        // ---- Portrait section ----
+        // ---- Portrait settings ----
         gmcm.AddSectionTitle(this.ModManifest, () => "Portrait Settings");
 
         gmcm.AddBoolOption(this.ModManifest,
@@ -477,10 +538,10 @@ public sealed class ModEntry : Mod
             () => "Prefer animated portraits",
             () => "Prioritise animated portrait sources (e.g. Animated Portraits mods) when available.");
 
-        // ---- Adult mod section (only when relevant) ----
+        // ---- Adult mod / gender settings ----
         if (this.activeAdultMods.Count > 0)
         {
-            gmcm.AddSectionTitle(this.ModManifest, () => "Adult Mod Settings");
+            gmcm.AddSectionTitle(this.ModManifest, () => "Adult Mod & Gender Settings");
 
             string familySummary = string.Join(", ", this.activeAdultMods.Select(m => m.Definition.FamilyName));
             gmcm.AddParagraph(this.ModManifest, () => $"Detected adult mods: {familySummary}.");
@@ -494,21 +555,32 @@ public sealed class ModEntry : Mod
                 () => "Force player body sprites",
                 () => "Always use a specific adult mod's sprites for the player, even outside its scenes.",
                 allowedValues: familiesAuto);
+
+            gmcm.AddTextOption(this.ModManifest,
+                () => this.config.PlayerGenderOverride ?? "Auto",
+                v  => this.config.PlayerGenderOverride = v,
+                () => "Player gender override",
+                () => "Override the player's effective gender used for scene-type routing and sprite selection. " +
+                      "'Auto' uses the actual character gender.",
+                allowedValues: ["Auto", "Male", "Female"]);
         }
 
-        // ---- Per-NPC portrait selection (only when multiple sources exist) ----
-        bool anyChoice = this.portraitSourcesByAsset.Values.Any(list =>
+        // ---- Per-NPC portrait source (text or image carousel) ----
+        bool anyPortraitChoice = this.portraitSourcesByAsset.Values.Any(list =>
             list.Select(s => s.ModUniqueId).Distinct(StringComparer.OrdinalIgnoreCase).Count() > 1);
 
-        if (anyChoice)
+        if (anyPortraitChoice)
         {
             gmcm.AddSectionTitle(this.ModManifest, () => "Per-NPC Portrait Source");
             gmcm.AddParagraph(this.ModManifest, () =>
-                "Choose which mod's portrait to use for each NPC when multiple options are available.");
+                gmcmOpts is not null
+                    ? "Scroll through portrait previews to pick the source for each NPC."
+                    : "Choose which mod's portrait to use for each NPC. Install GMCMOptions for image previews.");
 
             foreach (string assetName in this.portraitSourcesByAsset.Keys.OrderBy(k => k))
             {
-                string[] options = this.portraitSourcesByAsset[assetName]
+                List<PortraitSource> allSources = this.portraitSourcesByAsset[assetName];
+                string[] options = allSources
                     .Select(s => s.ModUniqueId)
                     .Distinct(StringComparer.OrdinalIgnoreCase)
                     .OrderBy(v => v)
@@ -517,20 +589,187 @@ public sealed class ModEntry : Mod
                 if (options.Length < 2)
                     continue;
 
-                // Capture loop variables for closures
-                string capturedNpc    = GetNpcNameFromAsset(assetName);
-                string[] capturedOpts = options;
+                string capturedNpc     = GetNpcNameFromAsset(assetName);
+                string[] capturedOpts  = options;
+
+                if (gmcmOpts is not null)
+                {
+                    // Build deduplicated source list per unique mod
+                    PortraitSource[] dedupSources = allSources
+                        .GroupBy(s => s.ModUniqueId, StringComparer.OrdinalIgnoreCase)
+                        .Select(g => g.First())
+                        .OrderBy(s => s.ModUniqueId, StringComparer.OrdinalIgnoreCase)
+                        .ToArray();
+
+                    this.RegisterImagePortraitOption(gmcm, gmcmOpts, capturedNpc, dedupSources);
+                }
+                else
+                {
+                    gmcm.AddTextOption(this.ModManifest,
+                        getValue: () => this.config.PreferredPortraitModByNpc.TryGetValue(capturedNpc, out string? v)
+                            ? v : capturedOpts[0],
+                        setValue: v  => this.config.PreferredPortraitModByNpc[capturedNpc] = v,
+                        name:     () => capturedNpc,
+                        tooltip:  () => $"Portrait source for {capturedNpc}.",
+                        allowedValues: capturedOpts);
+                }
+            }
+        }
+
+        // ---- Per-NPC sprite source ----
+        bool anySpriteChoice = this.spriteSourcesByAsset.Values.Any(list =>
+            list.Select(s => s.ModUniqueId).Distinct(StringComparer.OrdinalIgnoreCase).Count() > 1);
+
+        if (anySpriteChoice)
+        {
+            gmcm.AddSectionTitle(this.ModManifest, () => "Per-NPC Sprite Source");
+            gmcm.AddParagraph(this.ModManifest, () =>
+                "Override which mod's sprite sheet is used for each NPC outside of a dedicated adult scene.");
+
+            foreach (string assetName in this.spriteSourcesByAsset.Keys.OrderBy(k => k))
+            {
+                string[] opts = this.spriteSourcesByAsset[assetName]
+                    .Select(s => s.ModUniqueId)
+                    .Distinct(StringComparer.OrdinalIgnoreCase)
+                    .OrderBy(v => v)
+                    .ToArray();
+
+                if (opts.Length < 2)
+                    continue;
+
+                string capturedNpc  = GetNpcNameFromAsset(assetName);
+                string[] capturedOpts = opts;
 
                 gmcm.AddTextOption(this.ModManifest,
-                    getValue: () => this.config.PreferredPortraitModByNpc.TryGetValue(capturedNpc, out string? v) ? v : capturedOpts[0],
-                    setValue: v  => this.config.PreferredPortraitModByNpc[capturedNpc] = v,
-                    name:     () => capturedNpc,
-                    tooltip:  () => $"Portrait source for {capturedNpc}.",
+                    getValue: () => this.config.PreferredSpriteModByNpc.TryGetValue(capturedNpc, out string? v)
+                        ? v : capturedOpts[0],
+                    setValue: v  => this.config.PreferredSpriteModByNpc[capturedNpc] = v,
+                    name:     () => $"{capturedNpc} (sprite)",
+                    tooltip:  () => $"Sprite sheet source for {capturedNpc}. The scene-context system overrides this during adult scenes.",
                     allowedValues: capturedOpts);
             }
         }
 
+        // ---- Per-NPC gender override ----
+        if (this.activeAdultMods.Count > 0)
+        {
+            gmcm.AddSectionTitle(this.ModManifest, () => "NPC Gender Overrides");
+            gmcm.AddParagraph(this.ModManifest, () =>
+                "Override a specific NPC's gender for scene-type routing. " +
+                "Useful for role-playing as or with NPCs using non-default sprites.");
+
+            var allNpcNames = this.portraitSourcesByAsset.Keys
+                .Concat(this.spriteSourcesByAsset.Keys)
+                .Select(GetNpcNameFromAsset)
+                .Distinct(StringComparer.OrdinalIgnoreCase)
+                .OrderBy(n => n)
+                .ToList();
+
+            foreach (string npcName in allNpcNames)
+            {
+                string capturedNpc = npcName;
+                gmcm.AddTextOption(this.ModManifest,
+                    getValue: () => this.config.NpcGenderOverrides.TryGetValue(capturedNpc, out string? v) ? v : "Auto",
+                    setValue: v  =>
+                    {
+                        if (v == "Auto")
+                            this.config.NpcGenderOverrides.Remove(capturedNpc);
+                        else
+                            this.config.NpcGenderOverrides[capturedNpc] = v;
+                    },
+                    name:     () => $"{capturedNpc} gender",
+                    tooltip:  () => $"Gender routing override for {capturedNpc}. 'Auto' uses the NPC's actual gender.",
+                    allowedValues: ["Auto", "Male", "Female"]);
+            }
+        }
+
+        // ---- Per-NPC scene type preference ----
+        if (this.activeAdultMods.Count > 0 && this.scenePreSelector is not null)
+        {
+            var availableScenes = this.scenePreSelector.GetGloballyAvailableSceneTypes();
+            if (availableScenes.Count > 1)
+            {
+                gmcm.AddSectionTitle(this.ModManifest, () => "Scene Type Preferences");
+                gmcm.AddParagraph(this.ModManifest, () =>
+                    "Choose which type of adult scene to play with each NPC. " +
+                    "Options marked ⚠ are not compatible with your current gender overrides.");
+
+                var allNpcNames = this.portraitSourcesByAsset.Keys
+                    .Select(GetNpcNameFromAsset)
+                    .Distinct(StringComparer.OrdinalIgnoreCase)
+                    .OrderBy(n => n)
+                    .ToList();
+
+                foreach (string npcName in allNpcNames)
+                {
+                    string capturedNpc = npcName;
+                    string[] sceneOpts = this.scenePreSelector.BuildSceneTypeOptions(capturedNpc);
+
+                    if (sceneOpts.Length < 2)
+                        continue;
+
+                    gmcm.AddTextOption(this.ModManifest,
+                        getValue: () => this.config.SceneTypePreference.TryGetValue(capturedNpc, out string? v) ? v : "FM",
+                        setValue: v  => this.config.SceneTypePreference[capturedNpc] = v.TrimStart('⚠', ' '),
+                        name:     () => $"{capturedNpc} scene",
+                        tooltip:  () => $"Scene type preference for {capturedNpc}. ⚠ = incompatible with current gender settings.",
+                        allowedValues: sceneOpts);
+                }
+            }
+        }
+
         this.gmcmRegistered = true;
+    }
+
+    /// <summary>Registers an image-carousel portrait option via GMCMOptions.</summary>
+    private void RegisterImagePortraitOption(
+        IGenericModConfigMenuApi gmcm,
+        IGMCMOptionsApi gmcmOpts,
+        string npcName,
+        PortraitSource[] sources)
+    {
+        if (sources.Length == 0)
+            return;
+
+        string capturedNpc     = npcName;
+        PortraitSource[] capturedSources = sources;
+
+        gmcmOpts.AddImageOption(
+            this.ModManifest,
+            getValue: () =>
+            {
+                if (!this.config.PreferredPortraitModByNpc.TryGetValue(capturedNpc, out string? modId))
+                    return 0u;
+                int idx = Array.FindIndex(capturedSources, s =>
+                    string.Equals(s.ModUniqueId, modId, StringComparison.OrdinalIgnoreCase));
+                return idx >= 0 ? (uint)idx : 0u;
+            },
+            setValue: idx =>
+            {
+                if (idx < capturedSources.Length)
+                    this.config.PreferredPortraitModByNpc[capturedNpc] = capturedSources[idx].ModUniqueId;
+            },
+            name:         () => capturedNpc,
+            getMaxValue:  () => (uint)(capturedSources.Length - 1),
+            getTexture:   idx =>
+            {
+                if (idx >= (uint)capturedSources.Length)
+                    return null;
+                string filePath = capturedSources[(int)idx].FilePath;
+                // Return cached thumbnail, or load+cache it
+                if (!this.portraitThumbnailCache.TryGetValue(filePath, out Texture2D? tex))
+                {
+                    tex = this.TryLoadTexture(filePath);
+                    this.portraitThumbnailCache[filePath] = tex;
+                }
+                return tex;
+            },
+            getLabel:     idx => idx < (uint)capturedSources.Length
+                ? capturedSources[(int)idx].ModUniqueId
+                : string.Empty,
+            maxImageHeight: 128,
+            maxImageWidth:  128,
+            tooltip:      () => $"Portrait preview for {capturedNpc}. Scroll to choose the source mod.");
     }
 
     // -------------------------------------------------------------------------
@@ -541,6 +780,12 @@ public sealed class ModEntry : Mod
     {
         using FileStream stream = File.OpenRead(filePath);
         return Texture2D.FromStream(Game1.graphics.GraphicsDevice, stream);
+    }
+
+    private Texture2D? TryLoadTexture(string filePath)
+    {
+        try { return this.LoadTexture(filePath); }
+        catch { return null; }
     }
 
     private string? GetAdultFamily(string modUniqueId)

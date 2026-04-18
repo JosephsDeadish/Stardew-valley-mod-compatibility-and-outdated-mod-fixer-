@@ -29,4 +29,11 @@ internal sealed class AdultModDefinition
 
     /// <summary>Resolution priority used when no scene context is active.  Higher value wins.</summary>
     public int Priority { get; init; } = 0;
+
+    /// <summary>
+    /// Bitmask of scene interaction types this mod's content supports.
+    /// Used to determine which scene-type options are available or greyed-out in GMCM.
+    /// Defaults to FemaleMale (the most common case).
+    /// </summary>
+    public SceneTypeFlags SupportedSceneTypes { get; init; } = SceneTypeFlags.FemaleMale;
 }
