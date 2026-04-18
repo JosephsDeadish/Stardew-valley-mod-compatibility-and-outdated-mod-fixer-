@@ -1,0 +1,10 @@
+{
+  "Name": "Stardew Mod Compatibility Fixer",
+  "Author": "JosephsDeadish",
+  "Version": "1.2.0",
+  "Description": "Plug-and-play compatibility resolver for adult mods and legacy mods. Auto-detects and patches sprite/portrait conflicts, routes assets per active scene, supports gender overrides, scene-type preferences, and fixes outdated 1.5 mods for 1.6.",
+  "UniqueID": "JosephsDeadish.StardewModCompatibilityFixer",
+  "EntryDll": "StardewModCompatibilityFixer.dll",
+  "MinimumApiVersion": "4.0.0",
+  "UpdateKeys": []
+}
