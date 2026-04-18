@@ -1,8 +1,8 @@
 {
   "Name": "Stardew Mod Compatibility Fixer",
   "Author": "JosephsDeadish",
-  "Version": "1.0.0",
-  "Description": "Automatically detects portrait/body mod overlaps, adds portrait compatibility handling, and provides optional GMCM controls.",
+  "Version": "1.1.0",
+  "Description": "Plug-and-play compatibility resolver: auto-detects portrait/body/adult mod conflicts and routes sprites & portraits correctly per scene; detects and patches outdated 1.5-era mods to work with 1.6.",
   "UniqueID": "JosephsDeadish.StardewModCompatibilityFixer",
   "EntryDll": "StardewModCompatibilityFixer.dll",
   "MinimumApiVersion": "4.0.0",
